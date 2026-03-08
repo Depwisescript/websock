@@ -81,9 +81,10 @@ create_proxy_script() {
     cat > "$PROXY_SCRIPT" << 'PYEOF'
 #!/usr/bin/env python3
 """
-SSH WebSocket Proxy Server
+SSH WebSocket Proxy Server v1.1
 Acepta conexiones WebSocket y las reenvía al servidor SSH local.
 Soporta WS (puerto 80) y WSS (puerto 443 con TLS).
+Compatible con Python 3.8+ y websockets 10.x-14.x
 """
 
 import asyncio
@@ -91,18 +92,19 @@ import sys
 import ssl
 import signal
 import os
+import logging
 
-try:
-    import websockets
-    from websockets.asyncio.server import serve
-except ImportError:
-    # Fallback para versiones anteriores de websockets
-    import websockets
-    serve = websockets.serve
+# Silenciar logs de websockets (errores de handshake HTTP, etc.)
+logging.basicConfig(level=logging.WARNING, format="%(message)s")
+ws_logger = logging.getLogger("websockets")
+ws_logger.setLevel(logging.CRITICAL)
+
+import websockets
 
 BUFFER_SIZE = 8192
+WS_VERSION = tuple(int(x) for x in websockets.__version__.split(".")[:2])
 
-async def handle_ws(websocket):
+async def handle_ws(websocket, path=None):
     """Maneja una conexión WebSocket entrante y la reenvía a SSH."""
     ssh_host = "127.0.0.1"
     ssh_port = 22
@@ -111,20 +113,26 @@ async def handle_ws(websocket):
         reader, writer = await asyncio.open_connection(ssh_host, ssh_port)
     except ConnectionRefusedError:
         print(f"[!] SSH no está escuchando en {ssh_host}:{ssh_port}")
-        await websocket.close()
+        try: await websocket.close()
+        except: pass
         return
     except Exception as e:
         print(f"[!] Error conectando a SSH: {e}")
-        await websocket.close()
+        try: await websocket.close()
+        except: pass
         return
 
+    # Obtener IP del cliente de forma segura
     client_ip = "unknown"
     try:
-        client_ip = websocket.remote_address[0] if hasattr(websocket, 'remote_address') else "unknown"
+        if hasattr(websocket, 'remote_address') and websocket.remote_address:
+            client_ip = websocket.remote_address[0]
+        elif hasattr(websocket, 'request') and hasattr(websocket.request, 'headers'):
+            client_ip = websocket.request.headers.get("X-Forwarded-For", "unknown")
     except:
         pass
 
-    print(f"[+] Nueva conexión: {client_ip} → SSH")
+    print(f"[+] Nueva conexión WS: {client_ip} → SSH:{ssh_port}")
 
     async def ws_to_ssh():
         """WebSocket → SSH"""
@@ -135,10 +143,15 @@ async def handle_ws(websocket):
                 else:
                     writer.write(message)
                 await writer.drain()
+        except (websockets.exceptions.ConnectionClosed,
+                websockets.exceptions.ConnectionClosedOK,
+                websockets.exceptions.ConnectionClosedError):
+            pass
         except Exception:
             pass
         finally:
-            writer.close()
+            try: writer.close()
+            except: pass
 
     async def ssh_to_ws():
         """SSH → WebSocket"""
@@ -148,6 +161,10 @@ async def handle_ws(websocket):
                 if not data:
                     break
                 await websocket.send(data)
+        except (websockets.exceptions.ConnectionClosed,
+                websockets.exceptions.ConnectionClosedOK,
+                websockets.exceptions.ConnectionClosedError):
+            pass
         except Exception:
             pass
 
@@ -157,24 +174,55 @@ async def handle_ws(websocket):
         pass
     finally:
         print(f"[-] Conexión cerrada: {client_ip}")
-        writer.close()
+        try: writer.close()
+        except: pass
 
 
 async def start_server(port, ssl_context=None):
-    """Inicia el servidor WebSocket."""
+    """Inicia el servidor WebSocket con compatibilidad multi-versión."""
     mode = "WSS" if ssl_context else "WS"
-    print(f"[*] SSH WebSocket Proxy ({mode}) escuchando en puerto {port}")
+    print(f"[*] SSH WebSocket Proxy v1.1 ({mode}) → puerto {port}")
+    print(f"[*] websockets version: {websockets.__version__}")
 
-    try:
-        async with serve(handle_ws, "0.0.0.0", port, ssl=ssl_context,
-                         ping_interval=30, ping_timeout=60,
-                         max_size=2**20, compression=None):
-            await asyncio.Future()  # run forever
-    except TypeError:
-        # Fallback para versiones antiguas de websockets
-        server = await websockets.serve(handle_ws, "0.0.0.0", port, ssl=ssl_context,
-                                         ping_interval=30, ping_timeout=60,
-                                         max_size=2**20)
+    # websockets >= 14.0 usa la nueva API asyncio
+    if WS_VERSION >= (14, 0):
+        from websockets.asyncio.server import serve as async_serve
+        async with async_serve(
+            handle_ws, "0.0.0.0", port,
+            ssl=ssl_context,
+            ping_interval=30,
+            ping_timeout=60,
+            max_size=2**20,
+            compression=None,
+            logger=ws_logger,
+        ) as server:
+            print(f"[*] Servidor activo (asyncio API) — esperando conexiones...")
+            await asyncio.Future()
+
+    # websockets >= 10.0 usa serve como context manager
+    elif WS_VERSION >= (10, 0):
+        async with websockets.serve(
+            handle_ws, "0.0.0.0", port,
+            ssl=ssl_context,
+            ping_interval=30,
+            ping_timeout=60,
+            max_size=2**20,
+            compression=None,
+            logger=ws_logger,
+        ):
+            print(f"[*] Servidor activo (legacy API) — esperando conexiones...")
+            await asyncio.Future()
+
+    # websockets < 10.0
+    else:
+        server = await websockets.serve(
+            handle_ws, "0.0.0.0", port,
+            ssl=ssl_context,
+            ping_interval=30,
+            ping_timeout=60,
+            max_size=2**20,
+        )
+        print(f"[*] Servidor activo (classic API) — esperando conexiones...")
         await asyncio.Future()
 
 
@@ -194,14 +242,15 @@ def main():
         if os.path.exists(cert_file) and os.path.exists(key_file):
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_context.load_cert_chain(cert_file, key_file)
-            print(f"[*] TLS habilitado con certificado: {cert_file}")
+            print(f"[*] TLS habilitado: {cert_file}")
         else:
-            print(f"[!] Certificados no encontrados en {cert_dir}, iniciando sin TLS")
+            print(f"[!] Certificados no encontrados en {cert_dir}")
+            sys.exit(1)
 
+    # Event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Manejar señales de terminación
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, lambda: loop.stop())
