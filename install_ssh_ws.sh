@@ -48,12 +48,9 @@ show_banner() {
 install_deps() {
     echo -e "${CYAN}[1/5] Instalando dependencias...${NC}"
     apt-get update -qq > /dev/null 2>&1
-    apt-get install -y -qq python3 python3-pip openssl openssh-server > /dev/null 2>&1
+    apt-get install -y -qq python3 openssl openssh-server > /dev/null 2>&1
 
-    # Instalar websockets library para Python
-    pip3 install websockets > /dev/null 2>&1 || pip3 install websockets --break-system-packages > /dev/null 2>&1
-
-    echo -e "${GREEN}  ✔ Python3, pip, OpenSSL y websockets instalados.${NC}"
+    echo -e "${GREEN}  ✔ Python3, OpenSSL y OpenSSH instalados.${NC}"
 }
 
 # ── Generar certificado SSL auto-firmado ──
@@ -81,10 +78,12 @@ create_proxy_script() {
     cat > "$PROXY_SCRIPT" << 'PYEOF'
 #!/usr/bin/env python3
 """
-SSH WebSocket Proxy Server v1.1
-Acepta conexiones WebSocket y las reenvía al servidor SSH local.
-Soporta WS (puerto 80) y WSS (puerto 443 con TLS).
-Compatible con Python 3.8+ y websockets 10.x-14.x
+SSH WebSocket Proxy Server v2.0 (Raw TCP)
+Acepta conexiones HTTP/WS, responde 101 Switching Protocols,
+y hace pipe bidireccional raw TCP al servidor SSH local.
+
+Compatible con: HTTP Injector, HTTP Custom, HA Tunnel Plus, etc.
+Sin dependencias externas — solo stdlib de Python.
 """
 
 import asyncio
@@ -92,138 +91,140 @@ import sys
 import ssl
 import signal
 import os
-import logging
 
-# Silenciar logs de websockets (errores de handshake HTTP, etc.)
-logging.basicConfig(level=logging.WARNING, format="%(message)s")
-ws_logger = logging.getLogger("websockets")
-ws_logger.setLevel(logging.CRITICAL)
+BUFFER_SIZE = 65536
+SSH_HOST = "127.0.0.1"
+SSH_PORT = 22
 
-import websockets
+# Respuestas HTTP estándar
+RESPONSE_101 = (
+    b"HTTP/1.1 101 Switching Protocols\r\n"
+    b"Upgrade: websocket\r\n"
+    b"Connection: Upgrade\r\n"
+    b"\r\n"
+)
 
-BUFFER_SIZE = 8192
-WS_VERSION = tuple(int(x) for x in websockets.__version__.split(".")[:2])
+RESPONSE_200 = (
+    b"HTTP/1.1 200 Connection established\r\n"
+    b"\r\n"
+)
 
-async def handle_ws(websocket, path=None):
-    """Maneja una conexión WebSocket entrante y la reenvía a SSH."""
-    ssh_host = "127.0.0.1"
-    ssh_port = 22
+active_connections = 0
 
+async def pipe(reader, writer, label=""):
+    """Pipe bidireccional de datos entre dos streams."""
     try:
-        reader, writer = await asyncio.open_connection(ssh_host, ssh_port)
-    except ConnectionRefusedError:
-        print(f"[!] SSH no está escuchando en {ssh_host}:{ssh_port}")
-        try: await websocket.close()
-        except: pass
-        return
-    except Exception as e:
-        print(f"[!] Error conectando a SSH: {e}")
-        try: await websocket.close()
-        except: pass
-        return
-
-    # Obtener IP del cliente de forma segura
-    client_ip = "unknown"
-    try:
-        if hasattr(websocket, 'remote_address') and websocket.remote_address:
-            client_ip = websocket.remote_address[0]
-        elif hasattr(websocket, 'request') and hasattr(websocket.request, 'headers'):
-            client_ip = websocket.request.headers.get("X-Forwarded-For", "unknown")
-    except:
+        while True:
+            data = await reader.read(BUFFER_SIZE)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionResetError, BrokenPipeError, OSError):
         pass
-
-    print(f"[+] Nueva conexión WS: {client_ip} → SSH:{ssh_port}")
-
-    async def ws_to_ssh():
-        """WebSocket → SSH"""
-        try:
-            async for message in websocket:
-                if isinstance(message, str):
-                    writer.write(message.encode())
-                else:
-                    writer.write(message)
-                await writer.drain()
-        except (websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.ConnectionClosedOK,
-                websockets.exceptions.ConnectionClosedError):
-            pass
-        except Exception:
-            pass
-        finally:
-            try: writer.close()
-            except: pass
-
-    async def ssh_to_ws():
-        """SSH → WebSocket"""
-        try:
-            while True:
-                data = await reader.read(BUFFER_SIZE)
-                if not data:
-                    break
-                await websocket.send(data)
-        except (websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.ConnectionClosedOK,
-                websockets.exceptions.ConnectionClosedError):
-            pass
-        except Exception:
-            pass
-
-    try:
-        await asyncio.gather(ws_to_ssh(), ssh_to_ws())
     except Exception:
         pass
     finally:
-        print(f"[-] Conexión cerrada: {client_ip}")
-        try: writer.close()
-        except: pass
+        try:
+            writer.close()
+        except:
+            pass
+
+
+async def handle_client(client_reader, client_writer):
+    """Maneja cada conexión entrante."""
+    global active_connections
+    active_connections += 1
+
+    # Obtener IP del cliente
+    client_ip = "unknown"
+    try:
+        peername = client_writer.get_extra_info("peername")
+        if peername:
+            client_ip = peername[0]
+    except:
+        pass
+
+    ssh_writer = None
+    try:
+        # 1. Leer el payload HTTP del cliente
+        try:
+            payload = await asyncio.wait_for(client_reader.read(BUFFER_SIZE), timeout=10)
+        except asyncio.TimeoutError:
+            client_writer.close()
+            active_connections -= 1
+            return
+
+        if not payload:
+            client_writer.close()
+            active_connections -= 1
+            return
+
+        # 2. Detectar tipo de request y responder
+        payload_str = payload.decode("utf-8", errors="ignore").upper()
+
+        if "UPGRADE" in payload_str or "WEBSOCKET" in payload_str:
+            # WebSocket upgrade → responder 101
+            client_writer.write(RESPONSE_101)
+        elif "CONNECT" in payload_str:
+            # HTTP CONNECT → responder 200
+            client_writer.write(RESPONSE_200)
+        else:
+            # Cualquier otro HTTP → responder 200 (compatibilidad máxima)
+            client_writer.write(RESPONSE_200)
+
+        await client_writer.drain()
+
+        # 3. Conectar al servidor SSH local
+        try:
+            ssh_reader, ssh_writer = await asyncio.open_connection(SSH_HOST, SSH_PORT)
+        except ConnectionRefusedError:
+            print(f"[!] SSH no disponible en {SSH_HOST}:{SSH_PORT}")
+            client_writer.close()
+            active_connections -= 1
+            return
+        except Exception as e:
+            print(f"[!] Error SSH: {e}")
+            client_writer.close()
+            active_connections -= 1
+            return
+
+        print(f"[+] Conectado: {client_ip} → SSH (total: {active_connections})")
+
+        # 4. Pipe bidireccional: Cliente ↔ SSH
+        await asyncio.gather(
+            pipe(client_reader, ssh_writer, "C→S"),
+            pipe(ssh_reader, client_writer, "S→C"),
+        )
+
+    except Exception:
+        pass
+    finally:
+        active_connections -= 1
+        print(f"[-] Desconectado: {client_ip} (total: {active_connections})")
+        try:
+            client_writer.close()
+        except:
+            pass
+        if ssh_writer:
+            try:
+                ssh_writer.close()
+            except:
+                pass
 
 
 async def start_server(port, ssl_context=None):
-    """Inicia el servidor WebSocket con compatibilidad multi-versión."""
-    mode = "WSS" if ssl_context else "WS"
-    print(f"[*] SSH WebSocket Proxy v1.1 ({mode}) → puerto {port}")
-    print(f"[*] websockets version: {websockets.__version__}")
+    """Inicia el servidor TCP proxy."""
+    mode = "WSS+TLS" if ssl_context else "WS"
+    server = await asyncio.start_server(
+        handle_client, "0.0.0.0", port, ssl=ssl_context
+    )
+    print(f"[*] SSH WebSocket Proxy v2.0 ({mode}) → puerto {port}")
+    print(f"[*] Redirigiendo a SSH {SSH_HOST}:{SSH_PORT}")
+    print(f"[*] Esperando conexiones...")
 
-    # websockets >= 14.0 usa la nueva API asyncio
-    if WS_VERSION >= (14, 0):
-        from websockets.asyncio.server import serve as async_serve
-        async with async_serve(
-            handle_ws, "0.0.0.0", port,
-            ssl=ssl_context,
-            ping_interval=30,
-            ping_timeout=60,
-            max_size=2**20,
-            compression=None,
-            logger=ws_logger,
-        ) as server:
-            print(f"[*] Servidor activo (asyncio API) — esperando conexiones...")
-            await asyncio.Future()
-
-    # websockets >= 10.0 usa serve como context manager
-    elif WS_VERSION >= (10, 0):
-        async with websockets.serve(
-            handle_ws, "0.0.0.0", port,
-            ssl=ssl_context,
-            ping_interval=30,
-            ping_timeout=60,
-            max_size=2**20,
-            compression=None,
-            logger=ws_logger,
-        ):
-            print(f"[*] Servidor activo (legacy API) — esperando conexiones...")
-            await asyncio.Future()
-
-    # websockets < 10.0
-    else:
-        server = await websockets.serve(
-            handle_ws, "0.0.0.0", port,
-            ssl=ssl_context,
-            ping_interval=30,
-            ping_timeout=60,
-            max_size=2**20,
-        )
-        print(f"[*] Servidor activo (classic API) — esperando conexiones...")
-        await asyncio.Future()
+    async with server:
+        await server.serve_forever()
 
 
 def main():
@@ -247,7 +248,6 @@ def main():
             print(f"[!] Certificados no encontrados en {cert_dir}")
             sys.exit(1)
 
-    # Event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
